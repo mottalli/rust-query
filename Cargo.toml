@@ -1,0 +1,11 @@
+[package]
+name = "rust-query"
+version = "0.1.0"
+authors = ["Marcelo Mottalli <mottalli@yahoo.com>"]
+
+[dependencies]
+rand = "0.3"
+log = "0.3.4"
+env_logger = "0.3.2"
+memmap = "0.2.3"
+time = "0.1"

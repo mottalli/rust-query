@@ -1,0 +1,21 @@
+{
+    "majorVersion": "0",
+    "minorVersion": "4",
+    "numRows": "10000000",
+    "tableName": "table1",
+    "columns":
+    [
+        {
+            "name": "int32col",
+            "type": "int32",
+            "encoding": "raw",
+            "nullable": "true"
+        },
+        {
+            "name": "int64col",
+            "type": "int64",
+            "encoding": "raw",
+            "nullable": "true"
+        }
+    ]
+}
