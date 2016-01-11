@@ -61,32 +61,78 @@ impl NewRandomGenerator<i64> for i64 {
 }
 
 // -----------------------------------------------------------------------------------------------
-struct BlockTypedReader<R, T> 
+trait BlockReader {
+    fn next_block<'a>(&'a mut self) -> Option<&'a [u8]>;
+}
+
+struct BufBlockReader<R>
     where R: Read
 {
     reader: BufReader<R>,
+    bytes_to_consume: usize
+}
+
+
+impl<R> BufBlockReader<R> 
+    where R: Read
+{
+    fn new(reader: R) -> BufBlockReader<R> {
+        BufBlockReader {
+            reader: BufReader::new(reader),
+            bytes_to_consume: 0
+        }
+    }
+}
+
+impl<R> BlockReader for BufBlockReader<R>
+    where R: Read
+{
+    fn next_block<'a>(&'a mut self) -> Option<&'a [u8]> {
+        self.reader.consume(self.bytes_to_consume);
+        let buffer = self.reader.fill_buf().unwrap();
+        self.bytes_to_consume = buffer.len();
+        Some(buffer)
+    }
+}
+
+// -----------------------------------------------------------------------------------------------
+struct BlockTypedReader<R, T> 
+    where R: BufRead
+{
+    reader: R,
     bytes_to_consume: usize,
     _phantom: PhantomData<T>
 }
 
 impl<R, T> BlockTypedReader<R, T>
-    where R: Read
+    where R: BufRead
 {
     fn new(reader: R) -> BlockTypedReader<R, T> {
         BlockTypedReader {
-            reader: BufReader::new(reader),
+            reader: reader,
             bytes_to_consume: 0,
             _phantom: PhantomData
         }
     }
 
     fn next_block<'b>(&'b mut self) -> Option<&'b [T]> {
-        None
+        self.reader.consume(self.bytes_to_consume);
+        let buffer = self.reader.fill_buf().unwrap();
+        self.bytes_to_consume = buffer.len();
+
+        match self.bytes_to_consume {
+            0 => None,
+            _ => unsafe {
+                let ptr = buffer.as_ptr();
+                let size = self.bytes_to_consume / size_of::<T>();
+                Some(std::slice::from_raw_parts(ptr as *const T, size))
+            }
+        }
     }
 }
 
 impl<'a, R, T> Iterator for &'a mut BlockTypedReader<R, T>
-    where R: Read
+    where R: BufRead
 {
     type Item = &'a [T];
 
@@ -108,50 +154,40 @@ impl<'a, R, T> Iterator for &'a mut BlockTypedReader<R, T>
 
 // -----------------------------------------------------------------------------------------------
 struct RawValuesIterator<R, T>
-    where R: Read,
-          T: Copy
+    where R: BufRead
 {
-    reader: BufReader<R>,
+    reader: BlockTypedReader<R, T>,
     next_value_ptr: *const T,
-    remaining_values: usize,
-    bytes_to_consume: usize,
-    _phantom: PhantomData<T>
+    remaining_values: usize
 }
 
 impl<R, T> RawValuesIterator<R, T>
-    where R: Read,
-          T: Copy
+    where R: BufRead
 {
     fn new(reader: R) -> RawValuesIterator<R, T> {
         RawValuesIterator {
-            reader: BufReader::new(reader),
+            reader: BlockTypedReader::new(reader),
             next_value_ptr: std::ptr::null(),
-            remaining_values: 0,
-            bytes_to_consume: 0,
-            _phantom: PhantomData
+            remaining_values: 0
         }
     }
 }
 
 impl<R, T> Iterator for RawValuesIterator<R, T>
-    where R: Read,
+    where R: BufRead,
           T: Copy
 {
     type Item = T;
 
-    fn next(&mut self) -> Option<T> {
+    fn next(&mut self) -> Option<Self::Item> {
         if self.remaining_values == 0 {
-            self.reader.consume(self.bytes_to_consume);
-
-            let buffer: &[u8] = self.reader.fill_buf().unwrap();
-            self.bytes_to_consume = buffer.len();
-
-            if self.bytes_to_consume == 0 {
-                return None
+            match self.reader.next_block() {
+                None => return None,
+                Some(buffer) => {
+                    self.remaining_values = buffer.len();
+                    self.next_value_ptr = buffer.as_ptr();
+                }
             }
-
-            self.remaining_values = buffer.len() / size_of::<T>();
-            self.next_value_ptr = buffer.as_ptr() as *const T;
         } else {
             self.remaining_values -= 1;
             self.next_value_ptr = unsafe { self.next_value_ptr.offset(1) };
@@ -160,32 +196,6 @@ impl<R, T> Iterator for RawValuesIterator<R, T>
         unsafe { Some(*self.next_value_ptr) }
     }
 }
-
-// -----------------------------------------------------------------------------------------------
-/*
-struct CompressedValuesIterator<'a, T> {
-    reader: SnappyFramedDecoder<Cursor<&'a [u8]>>,
-    remaining_elements: usize,
-    _phantom: PhantomData<T>
-}
-
-impl<'a, T> CompressedValuesIterator<'a, T> {
-    fn new(compressed_data: &'a [u8]) -> CompressedValuesIterator<T> {
-        CompressedValuesIterator {
-            reader: SnappyFramedDecoder::new(Cursor::new(compressed_data), CrcMode::Ignore),
-            remaining_elements: 0,
-            _phantom: PhantomData
-        }
-    }
-}
-
-impl<'a, T> Iterator for CompressedValuesIterator<'a, T> {
-    type Item = T;
-
-    fn next(&mut self) -> Option<T> {
-    }
-}
-*/
 
 // -----------------------------------------------------------------------------------------------
 struct Column<T> {
@@ -216,16 +226,17 @@ impl<T> Column<T>
         }
     }
 
-    fn compressed_values_iterator(&self) -> RawValuesIterator<SnappyFramedDecoder<Cursor<&[u8]>>, T> {
+    /*fn compressed_values_iterator(&self) -> RawValuesIterator<SnappyFramedDecoder<Cursor<&[u8]>>, T> {
         let mut cursor = unsafe { Cursor::new(self.compressed_mmap.as_slice()) };
         let mut decoder = SnappyFramedDecoder::new(cursor, CrcMode::Ignore);
         RawValuesIterator::new(decoder)
-    }
-
-    /*fn compressed_values_iterator(&self) {
-        let mut cursor = unsafe { Cursor::new(self.compressed_mmap.as_slice()) };
-        let mut decoder = SnappyFramedDecoder::new(&mut cursor, CrcMode::Ignore);
     }*/
+
+    fn compressed_values_iterator<'a>(&'a self) -> Box<Iterator<Item=T> + 'a> {
+        let mut cursor = unsafe { Cursor::new(self.compressed_mmap.as_slice()) };
+        let mut decoder = SnappyFramedDecoder::new(cursor, CrcMode::Ignore);
+        Box::new(RawValuesIterator::new(BufReader::new(decoder)))
+    }
 }
 
 // -----------------------------------------------------------------------------------------------
