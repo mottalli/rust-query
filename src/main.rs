@@ -4,8 +4,8 @@ extern crate time;
 extern crate snappy_framed;
 
 use std::io;
-use std::io::{Write, BufWriter, Cursor, Bytes};
-use std::mem::size_of;
+use std::io::{Write, BufWriter, BufRead, BufReader, Cursor, Bytes, Read};
+use std::mem::{size_of, transmute};
 use std::path::{Path, PathBuf};
 use std::fs;
 use std::fs::{File};
@@ -15,6 +15,7 @@ use snappy_framed::write::SnappyFramedEncoder;
 use snappy_framed::read::{SnappyFramedDecoder, CrcMode};
 use std::marker::PhantomData;
 
+// -----------------------------------------------------------------------------------------------
 trait RandomGenerator<T> {
     fn generate_next(&mut self) -> T;
 }
@@ -59,12 +60,27 @@ impl NewRandomGenerator<i64> for i64 {
     }
 }
 
-struct Column<T> {
-    raw_mmap: Mmap,
-    compressed_mmap: Mmap,
-    _phantom: PhantomData<T>,
+/*
+struct RawValuesIterator<'a, R, T>
+    where R: Read + 'a
+{
+    reader: BufReader<R>,
+    _phantom: PhantomData<T>
 }
 
+impl<'a, R, T> RawValuesIterator<'a, R, T>
+    where R: Read + 'a
+{
+    fn new(reader: &'a R) -> RawValuesIterator<'a, R, T> {
+        RawValuesIterator {
+            reader: BufReader::new(reader),
+            _phantom: PhantomData
+        }
+    }
+}
+*/
+
+// -----------------------------------------------------------------------------------------------
 /*
 struct CompressedValuesIterator<'a, T> {
     reader: SnappyFramedDecoder<Cursor<&'a [u8]>>,
@@ -90,6 +106,13 @@ impl<'a, T> Iterator for CompressedValuesIterator<'a, T> {
 }
 */
 
+// -----------------------------------------------------------------------------------------------
+struct Column<T> {
+    raw_mmap: Mmap,
+    compressed_mmap: Mmap,
+    _phantom: PhantomData<T>,
+}
+
 impl<T> Column<T> {
     fn new<P: AsRef<Path>>(raw_file: P, compressed_file: P) -> Column<T> {
         Column {
@@ -110,13 +133,13 @@ impl<T> Column<T> {
         }
     }
 
-    fn compressed_values_iterator(&self) {
+    /*fn compressed_values_iterator(&self) {
         let mut cursor = unsafe { Cursor::new(self.compressed_mmap.as_slice()) };
         let mut decoder = SnappyFramedDecoder::new(&mut cursor, CrcMode::Ignore);
-
-    }
+    }*/
 }
 
+// -----------------------------------------------------------------------------------------------
 struct ColumnGenerator<T> {
     name: String,
     dir: PathBuf,
@@ -186,6 +209,7 @@ impl<T> ColumnGenerator<T>
     }
 }
 
+// -----------------------------------------------------------------------------------------------
 fn benchmark<F, R>(description: &str, mut f: F) -> R
     where F: FnMut() -> R 
 {
@@ -199,11 +223,13 @@ fn benchmark<F, R>(description: &str, mut f: F) -> R
     res
 }
 
+// -----------------------------------------------------------------------------------------------
 fn raw_bytes<T: Sized>(v: &T) -> &[u8] {
     let ptr = v as *const T;
     unsafe { std::slice::from_raw_parts(ptr as *const u8, size_of::<T>()) }
 }
 
+// -----------------------------------------------------------------------------------------------
 trait Nullable {
     fn null_value() -> Self;
 }
@@ -216,6 +242,7 @@ impl Nullable for i64 {
     fn null_value() -> i64 { std::i64::MIN }
 }
 
+// -----------------------------------------------------------------------------------------------
 struct Table {
     int32_column: Column<i32>,
     int64_column: Column<i64>
@@ -258,11 +285,31 @@ impl Table {
 
         println!("Result: {}", cnt);
     }
+
+    fn test_compress(&self) {
+        // let mut cursor = unsafe { Cursor::new(self.int32_column.compressed_mmap.as_slice()) };
+        let mut cursor = unsafe { Cursor::new(self.int32_column.compressed_mmap.as_slice()) };
+        let mut decoder = SnappyFramedDecoder::new(&mut cursor, CrcMode::Ignore);
+        let mut reader = BufReader::new(decoder);
+        let buffer: &[u8] = reader.fill_buf().unwrap();
+
+        println!("Read {} bytes", buffer.len());
+
+        let casted_buffer: &[i32] = unsafe {
+            let bytes = buffer.as_ptr();
+            let size = buffer.len() / size_of::<i32>();
+            std::slice::from_raw_parts(bytes as *const i32, size)
+        };
+
+        println!("Got a total of {} int32s", casted_buffer.len());
+    }
 }
+
+// -----------------------------------------------------------------------------------------------
 
 fn main() {
     let dest_dir = "/tmp/rust-query-table";
-    let n = 10_000_000;
+    let n = 1_000_000;
 
     let int32_column = ColumnGenerator::<i32>::new("int32_column", dest_dir).generate_random_column(n, 0.95).unwrap();
     let int64_column = ColumnGenerator::<i64>::new("int64_column", dest_dir).generate_random_column(n, 0.95).unwrap();
@@ -278,4 +325,6 @@ fn main() {
 
     benchmark("Query 1: Raw access", || table.query1());
     benchmark("Query 2: Raw access w/iterators", || table.query2());
+
+    table.test_compress();
 }
