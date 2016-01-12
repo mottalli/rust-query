@@ -4,16 +4,22 @@ extern crate time;
 extern crate snappy_framed;
 
 use std::io;
-use std::io::{Write, BufWriter, BufRead, BufReader, Cursor, Bytes, Read};
-use std::mem::{size_of, transmute};
+use std::io::{Write, BufWriter, BufRead, BufReader, Cursor, Read};
+use std::mem;
 use std::path::{Path, PathBuf};
-use std::fs;
 use std::fs::{File};
 use rand::Rng;
 use memmap::{Mmap, Protection};
 use snappy_framed::write::SnappyFramedEncoder;
 use snappy_framed::read::{SnappyFramedDecoder, CrcMode};
 use std::marker::PhantomData;
+
+// -----------------------------------------------------------------------------------------------
+fn cast_slice<'a, T>(s: &'a [u8]) -> &'a [T] {
+    let size = s.len() / mem::size_of::<T>();
+    let ptr = s.as_ptr() as *const T;
+    unsafe { std::slice::from_raw_parts(ptr, size) }
+}
 
 // -----------------------------------------------------------------------------------------------
 trait RandomGenerator<T> {
@@ -91,109 +97,75 @@ impl<R> BlockReader for BufBlockReader<R>
         self.reader.consume(self.bytes_to_consume);
         let buffer = self.reader.fill_buf().unwrap();
         self.bytes_to_consume = buffer.len();
-        Some(buffer)
+        match self.bytes_to_consume {
+            0 => None,
+            _ => Some(buffer)
+        }
     }
 }
 
 // -----------------------------------------------------------------------------------------------
-struct BlockTypedReader<R, T> 
-    where R: BufRead
-{
-    reader: R,
-    bytes_to_consume: usize,
-    _phantom: PhantomData<T>
+trait SliceGenerator<T> {
+    fn next_slice<'a>(&'a mut self) -> Option<&'a [T]>;
 }
 
-impl<R, T> BlockTypedReader<R, T>
-    where R: BufRead
+impl<R, T> SliceGenerator<T> for BufBlockReader<R>
+    where R: Read
 {
-    fn new(reader: R) -> BlockTypedReader<R, T> {
-        BlockTypedReader {
-            reader: reader,
-            bytes_to_consume: 0,
+    fn next_slice<'a>(&'a mut self) -> Option<&'a [T]> {
+        match self.next_block() {
+            None => None,
+            Some(s) => Some(cast_slice(s))
+        }
+    }
+}
+
+// -----------------------------------------------------------------------------------------------
+struct BlockValuesIterator<'a, R, T>
+    where R: Read,
+          T: 'a
+{
+    reader: BufBlockReader<R>,
+    next_value_ptr: *const T,
+    remaining_values: usize,
+    _phantom: PhantomData<&'a T>
+}
+
+impl<'a, R, T> BlockValuesIterator<'a, R, T>
+    where R: Read,
+          T: 'a
+{
+    fn new(reader: R) -> BlockValuesIterator<'a, R, T> {
+        BlockValuesIterator {
+            reader: BufBlockReader::new(reader),
+            next_value_ptr: std::ptr::null(),
+            remaining_values: 0,
             _phantom: PhantomData
         }
     }
-
-    fn next_block<'b>(&'b mut self) -> Option<&'b [T]> {
-        self.reader.consume(self.bytes_to_consume);
-        let buffer = self.reader.fill_buf().unwrap();
-        self.bytes_to_consume = buffer.len();
-
-        match self.bytes_to_consume {
-            0 => None,
-            _ => unsafe {
-                let ptr = buffer.as_ptr();
-                let size = self.bytes_to_consume / size_of::<T>();
-                Some(std::slice::from_raw_parts(ptr as *const T, size))
-            }
-        }
-    }
 }
 
-impl<'a, R, T> Iterator for &'a mut BlockTypedReader<R, T>
-    where R: BufRead
+impl<'a, R, T> Iterator for BlockValuesIterator<'a, R, T>
+    where R: Read,
+          T: 'a
 {
-    type Item = &'a [T];
-
-    fn next(&mut self) -> Option<&'a [T]> {
-        self.reader.consume(self.bytes_to_consume);
-        let buffer: &[u8] = self.reader.fill_buf().unwrap();
-        self.bytes_to_consume = buffer.len();
-
-        if self.bytes_to_consume == 0 {
-            None
-        } else {
-            let values_ptr = buffer.as_ptr() as *const u8;
-            let num_values = buffer.len() / size_of::<T>();
-            let result: &[T] = unsafe { std::slice::from_raw_parts(values_ptr as *const T, num_values) };
-            Some(result)
-        }
-    }
-}
-
-// -----------------------------------------------------------------------------------------------
-struct RawValuesIterator<R, T>
-    where R: BufRead
-{
-    reader: BlockTypedReader<R, T>,
-    next_value_ptr: *const T,
-    remaining_values: usize
-}
-
-impl<R, T> RawValuesIterator<R, T>
-    where R: BufRead
-{
-    fn new(reader: R) -> RawValuesIterator<R, T> {
-        RawValuesIterator {
-            reader: BlockTypedReader::new(reader),
-            next_value_ptr: std::ptr::null(),
-            remaining_values: 0
-        }
-    }
-}
-
-impl<R, T> Iterator for RawValuesIterator<R, T>
-    where R: BufRead,
-          T: Copy
-{
-    type Item = T;
+    type Item = &'a T;
 
     fn next(&mut self) -> Option<Self::Item> {
         if self.remaining_values == 0 {
-            match self.reader.next_block() {
+            match self.reader.next_slice() {
                 None => return None,
-                Some(buffer) => {
-                    self.remaining_values = buffer.len();
-                    self.next_value_ptr = buffer.as_ptr();
+                Some(s) => {
+                    self.next_value_ptr = s.as_ptr();
+                    self.remaining_values = s.len();
                 }
             }
         } else {
-            self.remaining_values -= 1;
             self.next_value_ptr = unsafe { self.next_value_ptr.offset(1) };
+            self.remaining_values -= 1;
         }
 
-        unsafe { Some(*self.next_value_ptr) }
+        unsafe { Some(&*self.next_value_ptr) }
     }
 }
 
@@ -216,26 +188,27 @@ impl<T> Column<T>
     }
 
     fn len(&self) -> usize {
-        self.raw_mmap.len() / std::mem::size_of::<T>()
+        self.raw_mmap.len() / mem::size_of::<T>()
     }
 
     fn raw_values(&self) -> &[T] {
         unsafe {
-            let ptr = self.raw_mmap.ptr();
-            std::slice::from_raw_parts(ptr as *const T, self.len())
+            cast_slice(self.raw_mmap.as_slice())
         }
     }
 
-    /*fn compressed_values_iterator(&self) -> RawValuesIterator<SnappyFramedDecoder<Cursor<&[u8]>>, T> {
-        let mut cursor = unsafe { Cursor::new(self.compressed_mmap.as_slice()) };
-        let mut decoder = SnappyFramedDecoder::new(cursor, CrcMode::Ignore);
-        RawValuesIterator::new(decoder)
-    }*/
 
-    fn compressed_values_iterator<'a>(&'a self) -> Box<Iterator<Item=T> + 'a> {
-        let mut cursor = unsafe { Cursor::new(self.compressed_mmap.as_slice()) };
-        let mut decoder = SnappyFramedDecoder::new(cursor, CrcMode::Ignore);
-        Box::new(RawValuesIterator::new(BufReader::new(decoder)))
+    fn raw_values_block_iterator<'a>(&'a self) -> Box<Iterator<Item=&T> + 'a> {
+        let cursor = unsafe { Cursor::new(self.raw_mmap.as_slice()) };
+        let it = BlockValuesIterator::new(cursor);
+        Box::new(it)
+    }
+
+    fn compressed_values_block_iterator<'a>(&'a self) -> Box<Iterator<Item=&T> + 'a> {
+        let cursor = unsafe { Cursor::new(self.compressed_mmap.as_slice()) };
+        let decoder = SnappyFramedDecoder::new(cursor, CrcMode::Ignore);
+        let it = BlockValuesIterator::new(decoder);
+        Box::new(it)
     }
 }
 
@@ -273,24 +246,30 @@ impl<T> ColumnGenerator<T>
 
     fn generate_random_column(&self, n: usize, null_probability: f32) -> io::Result<Column<T>> {
         let filename = self.filename();
-        println!("Generating {} random values into {}...", n, filename.display());
 
-        {
-            let mut writer = BufWriter::new(try!(File::create(filename)));
-            let mut rng = rand::thread_rng();
-            let mut generator: Box<RandomGenerator<T>> = T::new_random_generator();
+        match filename.metadata() {
+            Ok(_) => println!("File {} already exists. Skipping.", filename.display()),
+            Err(_) => {
+                println!("Generating {} random values into {}...", n, filename.display());
 
-            for _ in 0..n {
-                let val: T = if rng.next_f32() < null_probability {
-                    T::null_value()
-                } else {
-                    generator.generate_next()
-                };
+                {
+                    let mut writer = BufWriter::new(try!(File::create(filename)));
+                    let mut rng = rand::thread_rng();
+                    let mut generator: Box<RandomGenerator<T>> = T::new_random_generator();
 
-                writer.write(raw_bytes(&val)).expect("Could not write random values to file");
+                    for _ in 0..n {
+                        let val: T = if rng.next_f32() < null_probability {
+                            T::null_value()
+                        } else {
+                            generator.generate_next()
+                        };
+
+                        writer.write(raw_bytes(&val)).expect("Could not write random values to file");
+                    }
+                }
             }
         }
-        
+
         try!(self.compress_values());
 
         Ok(Column::new(self.filename(), self.compressed_filename()))
@@ -300,33 +279,49 @@ impl<T> ColumnGenerator<T>
         let src_filename = self.filename();
         let dest_filename = self.compressed_filename();
 
-        let mut src_reader = try!(File::open(&src_filename));
-        let mut dest_writer = try!(SnappyFramedEncoder::new(try!(File::create(&dest_filename))));
+        match dest_filename.metadata() {
+            Ok(_) => println!("File {} already exists. Skipping.", dest_filename.display()),
+            Err(_) => {
+                let mut src_reader = try!(File::open(&src_filename));
+                let mut dest_writer = try!(SnappyFramedEncoder::new(try!(File::create(&dest_filename))));
 
-        println!("Compresing values into {}...", dest_filename.display());
-        try!(io::copy(&mut src_reader, &mut dest_writer));
+                println!("Compresing values into {}...", dest_filename.display());
+                try!(io::copy(&mut src_reader, &mut dest_writer));
+            }
+        }
+
         Ok(())
     }
 }
 
 // -----------------------------------------------------------------------------------------------
-fn benchmark<F, R>(description: &str, mut f: F) -> R
-    where F: FnMut() -> R 
+fn benchmark<F>(description: &str, mut f: F)
+    where F: FnMut()
 {
+    let n = 2;
+
     println!("{}...", description);
-    let tic = time::now();
-    let res = f();
-    let toc = time::now();
-    
-    let delta = toc - tic;
-    println!("Elapsed: {} ms.", delta.num_milliseconds());
-    res
+
+    // Warmup call
+    f();
+
+    let mut total_time = 0;
+
+    for _ in 0..n {
+        let tic = time::now();
+        f();
+        let toc = time::now();
+        let delta = toc-tic;
+        total_time += delta.num_microseconds().unwrap();
+    }
+
+    println!("Avg. elapsed: {} µs.", total_time/n);
 }
 
 // -----------------------------------------------------------------------------------------------
 fn raw_bytes<T: Sized>(v: &T) -> &[u8] {
     let ptr = v as *const T;
-    unsafe { std::slice::from_raw_parts(ptr as *const u8, size_of::<T>()) }
+    unsafe { std::slice::from_raw_parts(ptr as *const u8, mem::size_of::<T>()) }
 }
 
 // -----------------------------------------------------------------------------------------------
@@ -363,18 +358,19 @@ impl Table {
 
         for i in 0..n {
             let int32 = int32_values[i];
-            let int64 = int64_values[i];
 
             if int32 == i32::null_value() {
                 continue;
-            } else if int64 == i64::null_value() {
-                continue;
+            } else {
+                let int64 = int64_values[i];
+
+                if int64 == i64::null_value() {
+                    continue;
+                }
             }
 
             cnt += 1;
         }
-
-        println!("Result: {}", cnt);
     }
 
     fn query2(&self) {
@@ -382,16 +378,18 @@ impl Table {
         let cnt = self.int32_column.raw_values().iter().zip(self.int64_column.raw_values().iter())
             .filter(|&v| *v.0 != i32::null_value() && *v.1 != i64::null_value())
             .count();
-
-        println!("Result: {}", cnt);
     }
 
     fn query3(&self) {
-        let cnt = self.int32_column.compressed_values_iterator().zip(self.int64_column.compressed_values_iterator())
-            .filter(|v| v.0 != i32::null_value() && v.1 != i64::null_value())
+        let cnt = self.int32_column.raw_values_block_iterator().zip(self.int64_column.raw_values_block_iterator())
+            .filter(|&v| *v.0 != i32::null_value() && *v.1 != i64::null_value())
             .count();
+    }
 
-        println!("Result: {}", cnt);
+    fn query4(&self) {
+        let cnt = self.int32_column.compressed_values_block_iterator().zip(self.int64_column.compressed_values_block_iterator())
+            .filter(|&v| *v.0 != i32::null_value() && *v.1 != i64::null_value())
+            .count();
     }
 }
 
@@ -409,12 +407,8 @@ fn main() {
         int64_column: int64_column
     };
 
-    println!("Warmup...");
-    table.query1();
-    table.query2();
-    table.query3();
-
     benchmark("Query 1: Raw access", || table.query1());
     benchmark("Query 2: Raw access w/iterators", || table.query2());
-    benchmark("Query 3: Compressed access w/iterators", || table.query3());
+    benchmark("Query 3: Block access w/iterators", || table.query3());
+    benchmark("Query 4: Block access w/iterators", || table.query4());
 }
